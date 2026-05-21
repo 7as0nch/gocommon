@@ -15,17 +15,20 @@ import (
 type AdapterCreator func(ctx context.Context, config *AgentConfig, subAgents []Agent) (Agent, error)
 
 // AgentFactory Agent 工厂接口
+// 统一使用 *AgentConfig 指针类型，避免大结构体值拷贝以及与 GORM 模型约定一致。
 type AgentFactory interface {
 	// RegisterAdapter 注册适配器创建函数
-	RegisterAdapter(adapterType string, creator AdapterCreator)
+	RegisterAdapter(adapterType AdapterType, creator AdapterCreator)
 
 	// Create 根据配置创建 Agent
-	Create(ctx context.Context, config AgentConfig) (Agent, error)
+	Create(ctx context.Context, config *AgentConfig) (Agent, error)
 
 	// CreateWithSubAgents 创建带子 Agent 的主 Agent
-	CreateWithSubAgents(ctx context.Context, masterConfig AgentConfig, subConfigs []AgentConfig) (Agent, error)
-
+	CreateWithSubAgents(ctx context.Context, masterConfig *AgentConfig, subConfigs []*AgentConfig) (Agent, error)
 }
+
+// 编译期断言：确保 DefaultFactory 满足 AgentFactory 接口
+var _ AgentFactory = (*DefaultFactory)(nil)
 
 // DefaultFactory 默认工厂实现
 type DefaultFactory struct {

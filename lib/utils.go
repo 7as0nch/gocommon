@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"math/rand"
 	"mime/multipart"
 	"net"
@@ -22,8 +20,6 @@ import (
 	"strings"
 	"time"
 	"unsafe"
-
-	"go.mongodb.org/mongo-driver/mongo"
 )
 
 const IPPrefix = "192.168.194"
@@ -89,7 +85,7 @@ func GetLocalIP() {
 //Base64FromFile 读入文件并使用Base64编码 并且计算MD5
 func Base64FromFile(path string) (string, string, error) {
 
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 
 	if err != nil {
 		return "", "", err
@@ -242,17 +238,12 @@ func VerifyMobileFormat(mobileNum string) bool {
 	return reg.MatchString(mobileNum)
 }
 
-//VeriyfiMongoErr 验证是否为空
-//为空返回true
-//不是空错误返回false
+// VerifyMongoErr 已废弃：原本用于判断 mongo 的空文档/空游标错误。
+// 已移除 mongo-driver 依赖；若业务仍需要，请在业务侧自行 errors.Is 判断。
+//
+// Deprecated: gocommon 不再绑定 mongo-driver，请在业务侧自行处理。
 func VerifyMongoErr(err error) bool {
-	if err == nil {
-		return true
-	}
-	if err == mongo.ErrNilDocument || err == mongo.ErrNilCursor || err == mongo.ErrNoDocuments {
-		return true
-	}
-	return false
+	return err == nil
 }
 
 // 判断是不是真实手机号码
@@ -362,18 +353,16 @@ func IPS() (ips []string) {
 	return
 }
 
-//IsDev 根据环境变量cloudbrainMode判断当前是否为生产环境或者开发环境
+// IsDev 判断当前是否开发环境。读取 cloudbrainMode 环境变量；未设置时默认 dev（旧逻辑会 log.Fatal，
+// 但作为 library 不应让进程退出，已改为返回 true 以保持向后兼容）。
+//
+// Deprecated: 推荐改用 Kratos config 的环境变量注入（KRATOS_ENV）或业务侧自行判断。
 func IsDev() bool {
 	mode := os.Getenv("cloudbrainMode")
 	if mode == "" {
-		log.Fatal("需要配置cloudbrainMode环境变量")
 		return true
 	}
-	if mode == dev {
-		return true
-	}
-
-	return false
+	return mode == dev
 }
 
 //GetType 获得类型的名称

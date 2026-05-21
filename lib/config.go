@@ -1,18 +1,23 @@
-//我们的配置的最终存储方式为 Key-> key->value的形式  以key _prod _dev为后缀来区分生产环境与开发环境
-//在生产环境中与开发环境中配置文件的写法完全不同
-//在开发环境中为一个一个的yaml结构的configmap文件，在内存中的存储结构为map[string]ConfigMap，其中Key为configMap的路径文件名
-//在生产环境中，配置文件为简单map[string]map[string]string 其中第一个Key为文件名，第二个Key为配置名 第三个就为配置值
+// 历史的配置加载方式：开发环境 YAML ConfigMap，生产环境 key=value 文本。
+// 该实现存在包级全局变量、panic、ioutil 等问题，不适合作为公共库被多项目复用。
+//
+// Deprecated: 新项目请改用 github.com/7as0nch/gocommon/lib/conf，基于 Kratos config，
+// 支持 YAML/JSON/Env/Apollo/Nacos 等多源，且无全局状态。
+// 本文件保留 ReadConfigMap / Config 接口的转发实现，以便老项目无痛升级；
+// 在下一个 minor 版本会移除。
 
 package lib
 
 import (
 	"bufio"
+	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v2"
 )
@@ -22,21 +27,19 @@ const (
 	prod = "prod"
 )
 
+// Config 旧版配置接口。
+//
+// Deprecated: 改用 conf.Loader.Scan(&Bootstrap{})。
 type Config interface {
 	Get(string) string
 	GetInt(string) int
 	GetBool(string) bool
 }
 
-var configDatas ConfigMap
-var configFileRead map[string]bool
-
+// ConfigMap 旧版配置在内存中的存储结构。
+//
+// Deprecated: 改用 conf.Load。
 type ConfigMap map[string]map[string]string
-
-func init() {
-	configDatas = make(ConfigMap)
-	configFileRead = map[string]bool{}
-}
 
 type metaData struct {
 	Name      string `yaml:"name"`
@@ -50,137 +53,165 @@ type configMapDesc struct {
 	Data       map[string]interface{} `yaml:"data"`
 }
 
-//ReadConfigMap 将configmap 读取到 内存
-func ReadConfigMap(filePath string) Config {
-	if IsDev() == true {
-		return ReadConfigMapDev(filePath)
-	} else {
-		return ReadConfigMapProd(filePath)
-	}
+// 包级状态用 sync 保护，避免多 goroutine 同时加载时 panic。
+// 注意：包级状态本身就是旧设计的缺陷；保留仅为向后兼容。
+var (
+	legacyMu        sync.Mutex
+	legacyDataStore = ConfigMap{}
+	legacyFileRead  = map[string]bool{}
+	deprecationOnce sync.Once
+)
+
+func warnDeprecated(api string) {
+	deprecationOnce.Do(func() {
+		log.Printf("[gocommon][DEPRECATED] lib.%s 已弃用，请改用 github.com/7as0nch/gocommon/lib/conf（基于 Kratos config）", api)
+	})
 }
 
+// ReadConfigMap 兼容老调用方：按 IsDev() 走 dev / prod 分支。
+//
+// Deprecated: 改用 conf.Load。
+func ReadConfigMap(filePath string) Config {
+	warnDeprecated("ReadConfigMap")
+	if IsDev() {
+		return ReadConfigMapDev(filePath)
+	}
+	return ReadConfigMapProd(filePath)
+}
+
+// ReadConfigMapDev 读取开发环境的 ConfigMap YAML 文件。
+//
+// Deprecated: 改用 conf.Load。
 func ReadConfigMapDev(filePath string) Config {
-	if _, ok := configFileRead[filePath]; ok {
-		return &configDatas
+	warnDeprecated("ReadConfigMapDev")
+	legacyMu.Lock()
+	defer legacyMu.Unlock()
+
+	if legacyFileRead[filePath] {
+		return &legacyDataStore
 	}
 
-	config := configMapDesc{}
-	file, err := os.Open(filePath)
-
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-	data, _ := ioutil.ReadAll(file)
-
-	err = yaml.Unmarshal([]byte(data), &config)
-
-	if err != nil {
-		panic(err)
+		log.Printf("[gocommon] ReadConfigMapDev open %q failed: %v", filePath, err)
+		return &legacyDataStore
 	}
 
-	for key, values := range config.Data {
-		settingsArray := strings.Split(values.(string), "\n")
+	cfg := configMapDesc{}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		log.Printf("[gocommon] ReadConfigMapDev unmarshal %q failed: %v", filePath, err)
+		return &legacyDataStore
+	}
+
+	for key, values := range cfg.Data {
+		text, ok := values.(string)
+		if !ok {
+			continue
+		}
 		settingsMap := map[string]string{}
-
-		for _, settings := range settingsArray {
-			if settings == "" {
+		for _, line := range strings.Split(text, "\n") {
+			if line == "" {
 				continue
 			}
-			items := strings.Split(settings, "=")
-			if len(items) > 1 {
+			items := strings.SplitN(line, "=", 2)
+			if len(items) == 2 {
 				settingsMap[items[0]] = items[1]
 			}
 		}
-		configDatas[key] = settingsMap
+		legacyDataStore[key] = settingsMap
 	}
-
-	configFileRead[filePath] = true
-
-	return &configDatas
+	legacyFileRead[filePath] = true
+	return &legacyDataStore
 }
 
+// ReadConfigMapProd 读取生产环境的 key=value 文本配置。
+//
+// Deprecated: 改用 conf.Load。
 func ReadConfigMapProd(filePath string) Config {
+	warnDeprecated("ReadConfigMapProd")
+	legacyMu.Lock()
+	defer legacyMu.Unlock()
 
 	file, err := os.Open(filePath)
-
 	if err != nil {
-		panic(err)
+		log.Printf("[gocommon] ReadConfigMapProd open %q failed: %v", filePath, err)
+		return &legacyDataStore
 	}
 	defer file.Close()
 
-	fileName := filepath.Base(filePath)
-
 	settings := map[string]string{}
-
 	br := bufio.NewReader(file)
 	for {
-		a, _, c := br.ReadLine()
-		if c == io.EOF {
+		line, _, e := br.ReadLine()
+		if e == io.EOF {
 			break
 		}
-		settingsLine := string(a)
-
-		items := strings.Split(settingsLine, "=")
-		if len(items) > 1 {
+		items := strings.SplitN(string(line), "=", 2)
+		if len(items) == 2 {
 			settings[items[0]] = items[1]
 		}
 	}
-	configDatas[fileName] = settings
-	return &configDatas
+	legacyDataStore[filepath.Base(filePath)] = settings
+	return &legacyDataStore
 }
 
-//Get 获取configMap中的配置 key格式为 module.key比如DB中的mysql
-//Key为 DB.mysql-URL
+// Get 通过 "module.key" 形式取值；env 后缀按 IsDev() 自动选择。
+//
+// Deprecated: 改用 conf.Loader.Value(...).String()。
 func (c *ConfigMap) Get(key string) string {
-
-	keyArray := strings.Split(key, ".")
-
+	keyArray := strings.SplitN(key, ".", 2)
 	if len(keyArray) < 2 {
-		panic("key format must be module.key")
+		log.Printf("[gocommon] ConfigMap.Get: key 必须形如 module.key，得到 %q", key)
+		return ""
 	}
+	module, subKey := keyArray[0], keyArray[1]
 
-	module := keyArray[0]
-
-	var realKey string
-	if IsDev() == true {
-		realKey = keyArray[1] + "-dev"
-	} else {
-		realKey = keyArray[1] + "-prod"
+	suffix := "-prod"
+	if IsDev() {
+		suffix = "-dev"
 	}
-
 	settingsMap := (map[string]map[string]string)(*c)
-
-	if settings, ok := settingsMap[module]; !ok {
-		panic("module not found.Check your module input")
-	} else {
-		if value, ok := settings[realKey]; !ok {
-			if value, ok = settings[keyArray[1]]; !ok {
-				panic("key not found.Check your settings")
-			} else {
-				return value
-			}
-		} else {
-			return value
-		}
+	settings, ok := settingsMap[module]
+	if !ok {
+		return ""
 	}
+	if v, ok := settings[subKey+suffix]; ok {
+		return v
+	}
+	return settings[subKey]
 }
 
+// GetInt 取 int；解析失败返回 0 + 日志。
+//
+// Deprecated: 改用 conf.Loader.Value(...).Int()。
 func (c *ConfigMap) GetInt(key string) int {
-	value := c.Get(key)
-	if data, err := strconv.Atoi(value); err != nil {
-		panic(err)
-	} else {
-		return data
+	v := c.Get(key)
+	if v == "" {
+		return 0
 	}
-
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("[gocommon] ConfigMap.GetInt %q: %v", key, err)
+		return 0
+	}
+	return n
 }
 
+// GetBool 取 bool；解析失败返回 false + 日志。
+//
+// Deprecated: 改用 conf.Loader.Value(...).Bool()。
 func (c *ConfigMap) GetBool(key string) bool {
-	value := c.Get(key)
-	if data, err := strconv.ParseBool(value); err != nil {
-		panic(err)
-	} else {
-		return data
+	v := c.Get(key)
+	if v == "" {
+		return false
 	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Printf("[gocommon] ConfigMap.GetBool %q: %v", key, err)
+		return false
+	}
+	return b
 }
+
+// 保留 fmt 引用占位，避免后续若添加错误消息时再引入。
+var _ = fmt.Sprintf
